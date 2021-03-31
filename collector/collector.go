@@ -45,6 +45,7 @@ type graphiteCollector struct {
 	lastProcessed      prometheus.Gauge
 	sampleExpiryMetric prometheus.Gauge
 	sampleExpiry       time.Duration
+	exposeTimestamps   bool
 }
 
 func NewGraphiteCollector(logger log.Logger, strictMatch bool, sampleExpiry time.Duration) *graphiteCollector {
@@ -78,6 +79,10 @@ func NewGraphiteCollector(logger log.Logger, strictMatch bool, sampleExpiry time
 	go c.processSamples()
 	go c.processLines()
 	return c
+}
+
+func (c *graphiteCollector) ExposeTimestamps(exposeTimestamps bool) {
+	c.exposeTimestamps = exposeTimestamps
 }
 
 func (c *graphiteCollector) ProcessReader(reader io.Reader) {
@@ -126,6 +131,32 @@ func (c *graphiteCollector) parseMetricNameAndTags(name string) (string, prometh
 	return parsedName, labels, err
 }
 
+func graphiteToPrometheusName(name string) string {
+	name = strings.Replace(name, ".", ":::", -1)
+	return invalidMetricChars.ReplaceAllString(name, "_")
+}
+
+func gsplit(name string) map[string]string {
+	split := strings.Split(name, ".")
+	labels := make(map[string]string)
+	for i, part := range split {
+		labelKey := fmt.Sprintf("gsplit_%d", i)
+		labels[labelKey] = part
+	}
+	return labels
+}
+
+func mergeLabels(s1 map[string]string, s2 map[string]string) map[string]string {
+	ret := make(map[string]string)
+	for k, v := range s1 {
+		ret[k] = v
+	}
+	for k, v := range s2 {
+		ret[k] = v
+	}
+	return ret
+}
+
 func (c *graphiteCollector) processLine(line string) {
 	line = strings.TrimSpace(line)
 	level.Debug(c.logger).Log("msg", "Incoming line", "line", line)
@@ -143,6 +174,9 @@ func (c *graphiteCollector) processLine(line string) {
 		level.Debug(c.logger).Log("msg", "Invalid tags", "line", line, "err", err.Error())
 	}
 
+	glabels := gsplit(originalName)
+	labels = mergeLabels(labels, glabels)
+
 	mapping, mappingLabels, mappingPresent := c.mapper.GetMapping(parsedName, mapper.MetricTypeGauge)
 
 	// add mapping labels to parsed labels
@@ -156,9 +190,9 @@ func (c *graphiteCollector) processLine(line string) {
 
 	var name string
 	if mappingPresent {
-		name = invalidMetricChars.ReplaceAllString(mapping.Name, "_")
+		name = graphiteToPrometheusName(mapping.Name)
 	} else {
-		name = invalidMetricChars.ReplaceAllString(parsedName, "_")
+		name = graphiteToPrometheusName(parsedName)
 	}
 
 	value, err := strconv.ParseFloat(parts[1], 64)
@@ -229,11 +263,16 @@ func (c graphiteCollector) Collect(ch chan<- prometheus.Metric) {
 		if ageLimit.After(sample.Timestamp) {
 			continue
 		}
-		ch <- prometheus.MustNewConstMetric(
+		var metric prometheus.Metric
+		metric = prometheus.MustNewConstMetric(
 			prometheus.NewDesc(sample.Name, sample.Help, []string{}, sample.Labels),
 			sample.Type,
 			sample.Value,
 		)
+		if c.exposeTimestamps {
+			metric = prometheus.NewMetricWithTimestamp(sample.Timestamp, metric)
+		}
+		ch <- metric
 	}
 }
 
